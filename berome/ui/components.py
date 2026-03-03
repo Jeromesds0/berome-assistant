@@ -113,6 +113,25 @@ def repo_table(repos: list[dict]) -> Table:
     return table
 
 
+def tool_call_panel(name: str, args: dict) -> Panel:
+    """Yellow bordered panel showing a tool call being executed."""
+    # Build a short args preview
+    parts = []
+    for k, v in args.items():
+        v_str = repr(v)
+        if len(v_str) > 50:
+            v_str = v_str[:47] + "..."
+        parts.append(f"{k}={v_str}")
+    args_preview = ", ".join(parts)
+    content = Text(f"{name}({args_preview})", style="berome.tool")
+    return Panel(
+        content,
+        title="[berome.tool] Tool Call [/berome.tool]",
+        border_style="yellow",
+        padding=(0, 1),
+    )
+
+
 def make_spinner(description: str = "Thinking…") -> Progress:
     return Progress(
         SpinnerColumn("dots"),
@@ -149,5 +168,6 @@ def help_panel() -> Panel:
 **Settings**
   /provider        Show active LLM provider
   /provider set anthropic|ollama     Switch provider (runtime)
+  /tokens          Show token usage for this session
 """
     return Panel(Markdown(help_text), title="[bold cyan] Berome Help [/bold cyan]", border_style="cyan")

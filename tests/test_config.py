@@ -5,8 +5,11 @@ import pytest
 from berome.config import LLMProvider, Settings
 
 
-def test_default_provider_is_anthropic():
-    s = Settings()
+def test_default_provider_is_anthropic(monkeypatch):
+    # Pass _env_file=None so pydantic-settings ignores the .env file and uses
+    # only the compiled default, which should be anthropic.
+    monkeypatch.delenv("BEROME_PROVIDER", raising=False)
+    s = Settings(_env_file=None)
     assert s.provider == LLMProvider.anthropic
 
 

@@ -8,9 +8,22 @@ from typing import AsyncIterator, Literal
 
 
 @dataclass
+class ToolCall:
+    """Represents a single tool call requested by the LLM."""
+
+    name: str
+    arguments: dict
+    id: str = ""
+
+
+@dataclass
 class LLMMessage:
-    role: Literal["user", "assistant", "system"]
+    role: Literal["user", "assistant", "system", "tool"]
     content: str
+    # Populated when role=="tool" to link back to the assistant's tool_use
+    tool_call_id: str = ""
+    # Populated on assistant messages that contain tool calls (agentic loop)
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 @dataclass
@@ -20,6 +33,7 @@ class LLMResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     stop_reason: str = "end_turn"
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 class LLMProvider(ABC):

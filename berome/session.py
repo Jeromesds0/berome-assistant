@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from berome.agents.base import AgentTask
 from berome.agents.chat_agent import ChatAgent
@@ -17,7 +17,7 @@ from berome.agents.github_agent import GitHubAgent
 from berome.agents.orchestrator import AgentOrchestrator
 from berome.agents.research_agent import ResearchAgent
 from berome.config import Settings, settings
-from berome.providers.base import LLMProvider
+from berome.providers.base import LLMProvider, LLMResponse
 from berome.providers.factory import get_provider
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,11 @@ class BeromeSession:
         self._orchestrator = AgentOrchestrator()
         self._chat_agent = ChatAgent(self._provider)
         self._setup_agents()
+        # Token tracking
+        self._session_input_tokens: int = 0
+        self._session_output_tokens: int = 0
+        self._last_input_tokens: int = 0
+        self._last_output_tokens: int = 0
 
     def _setup_agents(self) -> None:
         self._orchestrator.register(self._chat_agent)
@@ -59,11 +64,62 @@ class BeromeSession:
         self._orchestrator = AgentOrchestrator()
         self._setup_agents()
 
+    # ── Token tracking ────────────────────────────────────────────────────────
+
+    def _accumulate_tokens(self, response: LLMResponse) -> None:
+        """Record token usage from one LLM response."""
+        self._last_input_tokens = response.input_tokens
+        self._last_output_tokens = response.output_tokens
+        self._session_input_tokens += response.input_tokens
+        self._session_output_tokens += response.output_tokens
+
+    def token_stats(self) -> dict:
+        """Return current token usage counters."""
+        return {
+            "session_in": self._session_input_tokens,
+            "session_out": self._session_output_tokens,
+            "last_in": self._last_input_tokens,
+            "last_out": self._last_output_tokens,
+        }
+
     # ── Chat ──────────────────────────────────────────────────────────────────
 
     async def chat_stream(self, user_input: str):
-        """Yield token chunks from the chat agent."""
+        """Yield token chunks from the chat agent (simple streaming path)."""
         async for chunk in self._chat_agent.stream_response(user_input):
+            yield chunk
+
+    async def agentic_stream(
+        self,
+        user_input: str,
+        on_tool_call: Callable[[str, dict], Awaitable[None]],
+        on_tool_result: Callable,
+        require_confirmation: Optional[Callable[[str], Awaitable[bool]]] = None,
+    ):
+        """
+        Run the agentic tool-use loop, yielding the final text response.
+
+        Falls back to plain streaming if the provider lacks ``chat_with_tools``.
+        """
+        from berome.tools.definitions import TOOL_DEFINITIONS
+
+        if not hasattr(self._provider, "chat_with_tools"):
+            async for chunk in self.chat_stream(user_input):
+                yield chunk
+            return
+
+        # Reset per-response counters before starting
+        self._last_input_tokens = 0
+        self._last_output_tokens = 0
+
+        async for chunk in self._chat_agent.stream_agentic_response(
+            user_input=user_input,
+            tools=TOOL_DEFINITIONS,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+            require_confirmation=require_confirmation,
+            on_llm_response=self._accumulate_tokens,
+        ):
             yield chunk
 
     def clear_history(self) -> None:

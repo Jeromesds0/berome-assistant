@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from berome.agents.base import Agent, AgentTask
-from berome.providers.base import LLMMessage, LLMProvider
+from berome.providers.base import LLMMessage, LLMProvider, LLMResponse
 
 
 SYSTEM_PROMPT = """\
-You are Berome, a highly capable AI personal assistant.
+You are Berome, a highly capable AI personal assistant and coding tool.
 You can help with coding, research, project management, and GitHub operations.
 Be concise, precise, and always proactively suggest next steps when relevant.
-When the user asks you to perform an action (GitHub, files, etc.), clearly
-state what you're going to do and confirm the result.\
+
+When the user asks you to create files, run commands, or perform filesystem
+operations, use the available tools directly — do not just describe what to do.
+After completing a task, give a brief summary of what was done.\
 """
 
 
@@ -56,3 +58,69 @@ class ChatAgent(Agent):
             full_response.append(chunk)
             yield chunk
         self.add_message("assistant", "".join(full_response))
+
+    async def stream_agentic_response(
+        self,
+        user_input: str,
+        tools: list[dict],
+        on_tool_call: Callable[[str, dict], Awaitable[None]],
+        on_tool_result: Callable,
+        require_confirmation: Optional[Callable[[str], Awaitable[bool]]] = None,
+        on_llm_response: Optional[Callable[[LLMResponse], None]] = None,
+    ) -> AsyncIterator[str]:
+        """
+        Agentic tool-use loop.
+
+        Calls ``chat_with_tools`` on the provider, executes any tool calls,
+        feeds results back, and repeats until the LLM returns plain text
+        (or max 20 iterations).  The final text response is yielded as a
+        single chunk.
+        """
+        from berome.tools.executor import execute_tool
+
+        self.add_message("user", user_input)
+
+        for _iteration in range(20):
+            response = await self._llm.chat_with_tools(  # type: ignore[attr-defined]
+                messages=self._history,
+                tools=tools,
+                system=SYSTEM_PROMPT,
+            )
+
+            if on_llm_response is not None:
+                on_llm_response(response)
+
+            if not response.tool_calls:
+                # Final text — yield and finish
+                self.add_message("assistant", response.content)
+                yield response.content
+                return
+
+            # Assistant turn with tool calls — store in history
+            self._history.append(
+                LLMMessage(
+                    role="assistant",
+                    content=response.content or "",
+                    tool_calls=response.tool_calls,
+                )
+            )
+
+            # Execute each tool and accumulate results
+            for tc in response.tool_calls:
+                await on_tool_call(tc.name, tc.arguments)
+                result = await execute_tool(
+                    tc.name, tc.arguments, tc.id, require_confirmation
+                )
+                await on_tool_result(result)
+                # Store tool result in history
+                self._history.append(
+                    LLMMessage(
+                        role="tool",
+                        content=result.output,
+                        tool_call_id=tc.id,
+                    )
+                )
+
+        # Reached iteration limit
+        self.add_message("assistant", "Maximum tool use iterations reached.")
+        yield "Maximum tool use iterations reached."

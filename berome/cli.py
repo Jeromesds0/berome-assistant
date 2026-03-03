@@ -33,6 +33,7 @@ from berome.ui.components import (
     make_console,
     repo_table,
     success_panel,
+    tool_call_panel,
     user_panel,
 )
 from berome.ui.theme import BANNER, BEROME_THEME
@@ -111,11 +112,57 @@ async def _chat_loop(session, console: Console) -> None:
 
         # ── Regular chat ──────────────────────────────────────────────────────
         console.print(user_panel(user_input))
-        await _stream_chat(user_input, session, console)
+
+        if hasattr(session.provider, "chat_with_tools"):
+            await _agentic_stream_chat(user_input, session, console)
+        else:
+            await _simple_stream_chat(user_input, session, console)
 
 
-async def _stream_chat(user_input: str, session, console: Console) -> None:
-    """Stream the assistant response with live updating panel."""
+async def _agentic_stream_chat(user_input: str, session, console: Console) -> None:
+    """
+    Agentic chat path: tool-use loop with confirmation prompts and a
+    token footer after each response.
+    """
+    loop = asyncio.get_event_loop()
+
+    async def on_tool_call(name: str, args: dict) -> None:
+        console.print(tool_call_panel(name, args))
+
+    async def on_tool_result(result) -> None:
+        if result.error:
+            console.print(f"[berome.error]  ✗ {result.output[:120]}[/berome.error]")
+        else:
+            preview = result.output[:100].replace("\n", " ")
+            console.print(f"[berome.tool_result]  ✓ {preview}[/berome.tool_result]")
+
+    async def require_confirmation(command: str) -> bool:
+        answer = await loop.run_in_executor(
+            None,
+            lambda: input(f"\n  [berome] Run: {command!r}  [y/N] > "),
+        )
+        return answer.strip().lower() == "y"
+
+    final_parts: list[str] = []
+    try:
+        async for chunk in session.agentic_stream(
+            user_input, on_tool_call, on_tool_result, require_confirmation
+        ):
+            final_parts.append(chunk)
+    except Exception as exc:
+        console.print(error_panel(f"Error: {exc}"))
+        return
+
+    content = "".join(final_parts)
+    if content:
+        console.print(assistant_panel(content, model=session.provider.model_name))
+
+    # Token footer
+    _print_token_footer(session, console)
+
+
+async def _simple_stream_chat(user_input: str, session, console: Console) -> None:
+    """Plain streaming chat (no tools) with live-updating panel."""
     buffer: list[str] = []
 
     panel = Panel(
@@ -140,6 +187,21 @@ async def _stream_chat(user_input: str, session, console: Console) -> None:
                 live.update(panel)
         except Exception as exc:
             console.print(error_panel(f"Stream error: {exc}"))
+
+
+def _print_token_footer(session, console: Console) -> None:
+    """Print a dim token-usage footer line after a response."""
+    stats = session.token_stats()
+    if not (stats["last_in"] or stats["last_out"]):
+        return
+
+    def _fmt(n: int) -> str:
+        return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+    console.print(
+        f"[dim]  tokens: +{stats['last_in']} in / +{stats['last_out']} out"
+        f"  │  session: {_fmt(stats['session_in'])} in / {_fmt(stats['session_out'])} out[/dim]"
+    )
 
 
 # ── Slash command dispatcher ──────────────────────────────────────────────────
@@ -169,6 +231,24 @@ async def _handle_command(raw: str, session, console: Console) -> None:
             console.print(
                 Panel(Markdown(msg.content), title=f"[{style}]{label}[/{style}]", border_style=style)
             )
+
+    # ── Token usage ───────────────────────────────────────────────────────────
+    elif cmd == "tokens":
+        from rich import box
+        from rich.table import Table
+
+        stats = session.token_stats()
+
+        def _fmt(n: int) -> str:
+            return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+        t = Table(title="Token Usage", box=box.SIMPLE)
+        t.add_column("", style="bold")
+        t.add_column("Input", justify="right", style="cyan")
+        t.add_column("Output", justify="right", style="green")
+        t.add_row("Last response", str(stats["last_in"]), str(stats["last_out"]))
+        t.add_row("Session total", _fmt(stats["session_in"]), _fmt(stats["session_out"]))
+        console.print(t)
 
     # ── Provider ──────────────────────────────────────────────────────────────
     elif cmd == "provider":

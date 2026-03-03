@@ -16,6 +16,8 @@ BEROME_THEME = Theme(
         "berome.agent": "bold magenta",
         "berome.github": "bold white on dark_green",
         "berome.code": "bold bright_cyan",
+        "berome.tool": "bold yellow",
+        "berome.tool_result": "dim green",
     }
 )
 
