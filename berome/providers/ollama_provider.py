@@ -83,7 +83,8 @@ class OllamaProvider(LLMProvider):
                             "type": "function",
                             "function": {
                                 "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
+                                # Ollama expects a dict here, not a JSON string
+                                "arguments": tc.arguments,
                             },
                         }
                         for tc in msg.tool_calls
@@ -199,6 +200,8 @@ class OllamaProvider(LLMProvider):
         return LLMResponse(
             content=text_content,
             model=self._model,
+            input_tokens=data.get("prompt_eval_count", 0),
+            output_tokens=data.get("eval_count", 0),
             tool_calls=tool_calls,
             stop_reason="tool_use" if tool_calls else "end_turn",
         )
