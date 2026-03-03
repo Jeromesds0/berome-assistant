@@ -61,7 +61,6 @@ TOOL_DEFINITIONS: list[dict] = [
                     "description": "Directory path to list (defaults to '.').",
                 },
             },
-            "required": [],
         },
     },
     {

@@ -94,18 +94,24 @@ class OllamaProvider(LLMProvider):
         return result
 
     def _convert_tools(self, tools: list[dict]) -> list[dict]:
-        """Convert neutral tool defs to OpenAI/Ollama function format."""
-        return [
-            {
+        """Convert neutral tool defs to OpenAI/Ollama function format.
+
+        Strips ``required: []`` empty arrays — Ollama rejects them.
+        """
+        result = []
+        for t in tools:
+            params = dict(t["parameters"])
+            if "required" in params and not params["required"]:
+                del params["required"]
+            result.append({
                 "type": "function",
                 "function": {
                     "name": t["name"],
                     "description": t["description"],
-                    "parameters": t["parameters"],
+                    "parameters": params,
                 },
-            }
-            for t in tools
-        ]
+            })
+        return result
 
     async def chat(
         self,
@@ -164,7 +170,13 @@ class OllamaProvider(LLMProvider):
         }
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(f"{self._base_url}/api/chat", json=payload)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                body = r.text
+                raise RuntimeError(
+                    f"Ollama {r.status_code} — {body}\n"
+                    f"Ensure model {self._model!r} supports tool calling "
+                    f"(e.g. llama3.1, llama3.2, qwen2.5, mistral-nemo)."
+                )
             data = r.json()
 
         msg = data.get("message", {})
