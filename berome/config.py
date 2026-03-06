@@ -47,6 +47,14 @@ class Settings(BaseSettings):
         default_factory=lambda: Path.home() / ".berome" / "history"
     )
 
+    # ── Discord ────────────────────────────────────────────────────────────────
+    discord_token: Optional[str] = Field(None, alias="DISCORD_BOT_TOKEN")
+    discord_require_mention: bool = Field(True, alias="DISCORD_REQUIRE_MENTION")
+    # Comma-separated channel IDs where bot responds without @mention
+    discord_allowed_channels: str = Field("", alias="DISCORD_ALLOWED_CHANNELS")
+    # Auto-approve shell command confirmations (only for trusted/private servers)
+    discord_auto_approve_tools: bool = Field(False, alias="DISCORD_AUTO_APPROVE_TOOLS")
+
     @field_validator("provider", mode="before")
     @classmethod
     def _coerce_provider(cls, v: str) -> str:
@@ -59,6 +67,12 @@ class Settings(BaseSettings):
             if self.provider == LLMProvider.anthropic
             else self.ollama_model
         )
+
+    def discord_allowed_channel_ids(self) -> set[int]:
+        """Parse DISCORD_ALLOWED_CHANNELS into a set of channel ID ints."""
+        if not self.discord_allowed_channels:
+            return set()
+        return {int(c.strip()) for c in self.discord_allowed_channels.split(",") if c.strip()}
 
 
 # Module-level singleton – import this everywhere

@@ -5,27 +5,21 @@ from __future__ import annotations
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from berome.agents.base import Agent, AgentTask
+from berome.prompts import load as _load_prompt
 from berome.providers.base import LLMMessage, LLMProvider, LLMResponse
 
 
-SYSTEM_PROMPT = """\
-You are Berome, a highly capable AI personal assistant and coding tool.
-You can help with coding, research, project management, and GitHub operations.
-Be concise, precise, and always proactively suggest next steps when relevant.
-
-When the user asks you to create files, run commands, or perform filesystem
-operations, use the available tools directly — do not just describe what to do.
-After completing a task, give a brief summary of what was done.\
-"""
+SYSTEM_PROMPT = _load_prompt("cli_system.md")
 
 
 class ChatAgent(Agent):
     agent_type = "chat"
     description = "Handles multi-turn conversation with the LLM"
 
-    def __init__(self, provider: LLMProvider) -> None:
+    def __init__(self, provider: LLMProvider, system_prompt: str = SYSTEM_PROMPT) -> None:
         super().__init__(provider)
         self._history: list[LLMMessage] = []
+        self._system_prompt = system_prompt
 
     def add_message(self, role: str, content: str) -> None:
         self._history.append(LLMMessage(role=role, content=content))  # type: ignore[arg-type]
@@ -42,7 +36,7 @@ class ChatAgent(Agent):
         self.add_message("user", user_input)
         response = await self._llm.chat(
             messages=self._history,
-            system=SYSTEM_PROMPT,
+            system=self._system_prompt,
         )
         self.add_message("assistant", response.content)
         return response.content
@@ -53,7 +47,7 @@ class ChatAgent(Agent):
         full_response = []
         async for chunk in self._llm.stream(
             messages=self._history,
-            system=SYSTEM_PROMPT,
+            system=self._system_prompt,
         ):
             full_response.append(chunk)
             yield chunk
@@ -84,7 +78,7 @@ class ChatAgent(Agent):
             response = await self._llm.chat_with_tools(  # type: ignore[attr-defined]
                 messages=self._history,
                 tools=tools,
-                system=SYSTEM_PROMPT,
+                system=self._system_prompt,
             )
 
             if on_llm_response is not None:

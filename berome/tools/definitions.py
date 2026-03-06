@@ -100,6 +100,28 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
+        "name": "web_search",
+        "description": (
+            "Search the web using DuckDuckGo and return the top results. "
+            "Use this to look up current events, pop culture, memes, recent news, "
+            "documentation, or anything that requires up-to-date information."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Number of results to return (default 5, max 10).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "delete_file",
         "description": (
             "Delete a file (not a directory) from the local filesystem."

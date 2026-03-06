@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from berome.agents.base import AgentTask
-from berome.agents.chat_agent import ChatAgent
+from berome.agents.chat_agent import ChatAgent, SYSTEM_PROMPT
 from berome.agents.code_agent import CodeAgent
 from berome.agents.github_agent import GitHubAgent
 from berome.agents.orchestrator import AgentOrchestrator
@@ -26,11 +26,12 @@ logger = logging.getLogger(__name__)
 class BeromeSession:
     """Top-level session object: one per CLI invocation."""
 
-    def __init__(self, cfg: Settings = settings) -> None:
+    def __init__(self, cfg: Settings = settings, system_prompt: str = SYSTEM_PROMPT) -> None:
         self.cfg = cfg
+        self._system_prompt = system_prompt
         self._provider: LLMProvider = get_provider()
         self._orchestrator = AgentOrchestrator()
-        self._chat_agent = ChatAgent(self._provider)
+        self._chat_agent = ChatAgent(self._provider, system_prompt=self._system_prompt)
         self._setup_agents()
         # Token tracking
         self._session_input_tokens: int = 0
@@ -55,12 +56,12 @@ class BeromeSession:
         import os
         os.environ["BEROME_PROVIDER"] = provider_name
         # Reload settings and rebuild provider
-        from berome.config import LLMProvider as PE, Settings
+        from berome.config import Settings
         new_cfg = Settings()
         self.cfg = new_cfg
         self._provider = get_provider()
-        # Rebuild agents with new provider
-        self._chat_agent = ChatAgent(self._provider)
+        # Rebuild agents with new provider, preserving any custom system prompt
+        self._chat_agent = ChatAgent(self._provider, system_prompt=self._system_prompt)
         self._orchestrator = AgentOrchestrator()
         self._setup_agents()
 
@@ -124,6 +125,10 @@ class BeromeSession:
 
     def clear_history(self) -> None:
         self._chat_agent.clear_history()
+
+    def add_history_message(self, role: str, content: str) -> None:
+        """Inject a message into the conversation history (e.g. for seeding context)."""
+        self._chat_agent.add_message(role, content)
 
     def history(self):
         return self._chat_agent.history

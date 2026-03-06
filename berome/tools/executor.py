@@ -41,6 +41,7 @@ async def execute_tool(
         "create_directory": _create_directory,
         "run_command": _run_command,
         "delete_file": _delete_file,
+        "web_search": _web_search,
     }
     handler = dispatch.get(name)
     if handler is None:
@@ -197,6 +198,42 @@ async def _run_command(
     except Exception as exc:
         return ToolResult(
             tool_name="run_command",
+            tool_call_id=tool_call_id,
+            output=str(exc),
+            error=True,
+        )
+
+
+async def _web_search(
+    args: dict, tool_call_id: str, _confirm: ConfirmFn
+) -> ToolResult:
+    query = args.get("query", "")
+    max_results = min(int(args.get("max_results", 5)), 10)
+    try:
+        from ddgs import DDGS
+
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                title = r.get("title", "")
+                href = r.get("href", "")
+                body = r.get("body", "")
+                results.append(f"**{title}**\n{href}\n{body}")
+
+        if not results:
+            return ToolResult(
+                tool_name="web_search",
+                tool_call_id=tool_call_id,
+                output="No results found.",
+            )
+        return ToolResult(
+            tool_name="web_search",
+            tool_call_id=tool_call_id,
+            output="\n\n---\n\n".join(results),
+        )
+    except Exception as exc:
+        return ToolResult(
+            tool_name="web_search",
             tool_call_id=tool_call_id,
             output=str(exc),
             error=True,
