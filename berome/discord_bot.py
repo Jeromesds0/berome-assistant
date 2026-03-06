@@ -55,6 +55,7 @@ TOOL_EMOJI: dict[str, str] = {
     "run_command": "⚙️",
     "delete_file": "🗑️",
     "web_search": "🔍",
+    "image_search": "🖼️",
 }
 
 # MIME types accepted for image analysis

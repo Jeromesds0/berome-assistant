@@ -100,6 +100,28 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
+        "name": "image_search",
+        "description": (
+            "Search the web for images and return direct image URLs. "
+            "Use this when asked to find, send, or share a meme, photo, or any image. "
+            "Returns real URLs that Discord will auto-embed. Never guess or fabricate URLs."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The image search query, e.g. 'gigachad meme' or 'cat funny'.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Number of image URLs to return (default 1, max 5).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "web_search",
         "description": (
             "Search the web using DuckDuckGo and return the top results. "

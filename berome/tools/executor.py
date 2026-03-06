@@ -41,6 +41,7 @@ async def execute_tool(
         "create_directory": _create_directory,
         "run_command": _run_command,
         "delete_file": _delete_file,
+        "image_search": _image_search,
         "web_search": _web_search,
     }
     handler = dispatch.get(name)
@@ -198,6 +199,41 @@ async def _run_command(
     except Exception as exc:
         return ToolResult(
             tool_name="run_command",
+            tool_call_id=tool_call_id,
+            output=str(exc),
+            error=True,
+        )
+
+
+async def _image_search(
+    args: dict, tool_call_id: str, _confirm: ConfirmFn
+) -> ToolResult:
+    query = args.get("query", "")
+    max_results = min(int(args.get("max_results", 1)), 5)
+    try:
+        from ddgs import DDGS
+
+        urls: list[str] = []
+        with DDGS() as ddgs:
+            for r in ddgs.images(query, max_results=max_results):
+                url = r.get("image") or r.get("url", "")
+                if url:
+                    urls.append(url)
+
+        if not urls:
+            return ToolResult(
+                tool_name="image_search",
+                tool_call_id=tool_call_id,
+                output="No images found for that query.",
+            )
+        return ToolResult(
+            tool_name="image_search",
+            tool_call_id=tool_call_id,
+            output="\n".join(urls),
+        )
+    except Exception as exc:
+        return ToolResult(
+            tool_name="image_search",
             tool_call_id=tool_call_id,
             output=str(exc),
             error=True,
