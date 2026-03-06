@@ -133,6 +133,7 @@ class BeromeBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # Required to read message text
+        intents.members = True  # Required to list guild members for @mentions
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self._sessions: dict[int, BeromeSession] = {}
@@ -155,6 +156,7 @@ class BeromeBot(discord.Client):
                 logger.info("Creating new BeromeSession for channel %d", channel_id)
                 system_prompt = self._build_system_prompt(channel)
                 session = BeromeSession(system_prompt=system_prompt)
+                await self._seed_members(session, channel)
                 await self._seed_history(session, channel)
                 self._sessions[channel_id] = session
             except RuntimeError as exc:
@@ -177,6 +179,33 @@ class BeromeBot(discord.Client):
             DISCORD_SYSTEM_PROMPT
             + f"\n\n**Facts you've been taught about this server:**\n{facts}"
         )
+
+    async def _seed_members(
+        self, session: BeromeSession, channel: discord.abc.Messageable
+    ) -> None:
+        """Inject server member list so the bot knows how to @mention people."""
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return  # DM — no members to inject
+        try:
+            members = [m for m in guild.members if not m.bot]
+            if not members:
+                return
+            lines = [
+                f"- {m.display_name} (username: {m.name}, mention: <@{m.id}>)"
+                for m in members
+            ]
+            member_list = "\n".join(lines)
+            session.add_history_message(
+                "user",
+                f"[System]: Server members you can @mention (use the exact mention format shown):\n{member_list}",
+            )
+            session.add_history_message(
+                "assistant",
+                "Got it. I know the server members and their mention formats.",
+            )
+        except Exception as exc:
+            logger.warning("Could not seed member list: %s", exc)
 
     async def _seed_history(
         self, session: BeromeSession, channel: discord.abc.Messageable
