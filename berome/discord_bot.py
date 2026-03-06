@@ -269,7 +269,22 @@ class BeromeBot(discord.Client):
         if message.author == self.user:
             return
 
-        if not self._should_respond(message):
+        should_respond = self._should_respond(message)
+
+        # Passively record human messages into existing sessions so the bot
+        # stays aware of the full conversation, even when not @mentioned.
+        if not should_respond and not message.author.bot:
+            channel_id = message.channel.id
+            if channel_id in self._sessions:
+                text = self._extract_text(message)
+                if text:
+                    display = message.author.display_name
+                    self._sessions[channel_id].add_history_message(
+                        "user", f"[{display}]: {text}"
+                    )
+            return
+
+        if not should_respond:
             return
 
         user_text = self._extract_text(message)
@@ -399,13 +414,12 @@ class BeromeBot(discord.Client):
         response_parts: list[str] = []
         try:
             async with channel.typing():
+                display = message.author.display_name
                 if images:
                     # Build multimodal content block (images + optional text)
                     content_blocks: list[dict] = list(images)
-                    if user_text:
-                        content_blocks.append({"type": "text", "text": user_text})
-                    else:
-                        content_blocks.append({"type": "text", "text": "What's in this image?"})
+                    prompt = f"[{display}]: {user_text}" if user_text else f"[{display}]: What's in this image?"
+                    content_blocks.append({"type": "text", "text": prompt})
                     session.add_history_message("user", content_blocks)
                     async for chunk in session.continue_agentic_stream(
                         on_tool_call, on_tool_result, require_confirmation
@@ -413,11 +427,11 @@ class BeromeBot(discord.Client):
                         response_parts.append(chunk)
                 elif hasattr(session.provider, "chat_with_tools"):
                     async for chunk in session.agentic_stream(
-                        user_text, on_tool_call, on_tool_result, require_confirmation
+                        f"[{display}]: {user_text}", on_tool_call, on_tool_result, require_confirmation
                     ):
                         response_parts.append(chunk)
                 else:
-                    async for chunk in session.chat_stream(user_text):
+                    async for chunk in session.chat_stream(f"[{display}]: {user_text}"):
                         response_parts.append(chunk)
         except Exception as exc:
             logger.exception("Error during stream for channel %d", channel.id)
