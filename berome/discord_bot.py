@@ -6,8 +6,10 @@ Architecture:
 - Sessions are in-memory; cleared on /clear or bot restart.
 - Sessions idle for >1 hour are automatically evicted.
 - agentic_stream() is used when the provider supports chat_with_tools.
-- Responses are collected fully, then sent (edit-after-complete strategy).
+- Images in messages are downloaded, base64-encoded, and passed to the LLM.
 - Shell command confirmations use discord.ui.View with Confirm/Cancel buttons.
+- Guild memories (/teach, /forget) are persisted across restarts.
+- Active channels (/activate, /deactivate) respond without @mention.
 
 Usage:
     from berome.discord_bot import BeromeBot
@@ -17,14 +19,23 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import time
 from typing import Optional
 
 import discord
+import httpx
 from discord import app_commands
 
 from berome.config import settings
+from berome.guild_data import (
+    add_memory,
+    load_active_channels,
+    load_memories,
+    remove_memory,
+    save_active_channels,
+)
 from berome.prompts import load as _load_prompt
 from berome.session import BeromeSession
 
@@ -45,6 +56,9 @@ TOOL_EMOJI: dict[str, str] = {
     "delete_file": "🗑️",
     "web_search": "🔍",
 }
+
+# MIME types accepted for image analysis
+_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 
 # ── Confirmation UI ────────────────────────────────────────────────────────────
@@ -122,14 +136,15 @@ class BeromeBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self._sessions: dict[int, BeromeSession] = {}
         self._session_last_used: dict[int, float] = {}
+        self._active_channels: set[int] = load_active_channels()
 
     # ── Session management ─────────────────────────────────────────────────
 
     async def _get_session(self, channel: discord.abc.Messageable) -> Optional[BeromeSession]:
         """Return (or create) a BeromeSession for the given channel.
 
-        On first creation, seeds the session with recent channel history so the
-        bot has context about how people speak and what was already discussed.
+        On first creation, seeds the session with recent channel history and
+        any guild memories that have been taught via /teach.
         """
         channel_id = channel.id  # type: ignore[attr-defined]
         self._evict_stale_sessions()
@@ -137,7 +152,8 @@ class BeromeBot(discord.Client):
         if channel_id not in self._sessions:
             try:
                 logger.info("Creating new BeromeSession for channel %d", channel_id)
-                session = BeromeSession(system_prompt=DISCORD_SYSTEM_PROMPT)
+                system_prompt = self._build_system_prompt(channel)
+                session = BeromeSession(system_prompt=system_prompt)
                 await self._seed_history(session, channel)
                 self._sessions[channel_id] = session
             except RuntimeError as exc:
@@ -147,6 +163,20 @@ class BeromeBot(discord.Client):
                 return None
         return self._sessions[channel_id]
 
+    def _build_system_prompt(self, channel: discord.abc.Messageable) -> str:
+        """Build a system prompt that includes any guild memories."""
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if guild_id is None:
+            return DISCORD_SYSTEM_PROMPT
+        memories = load_memories(guild_id)
+        if not memories:
+            return DISCORD_SYSTEM_PROMPT
+        facts = "\n".join(f"- {m}" for m in memories)
+        return (
+            DISCORD_SYSTEM_PROMPT
+            + f"\n\n**Facts you've been taught about this server:**\n{facts}"
+        )
+
     async def _seed_history(
         self, session: BeromeSession, channel: discord.abc.Messageable
     ) -> None:
@@ -154,9 +184,9 @@ class BeromeBot(discord.Client):
 
         This gives the bot awareness of ongoing conversation style and context.
         Bot's own messages are added as 'assistant'; others as 'user'.
-        Tool-status messages (Thinking..., emoji previews) are skipped.
+        Tool-status messages are skipped.
         """
-        _tool_prefixes = tuple(TOOL_EMOJI.values()) + ("*Thinking...*",)
+        _tool_prefixes = tuple(TOOL_EMOJI.values())
         messages: list[tuple[str, str]] = []
         try:
             async for msg in channel.history(  # type: ignore[attr-defined]
@@ -164,10 +194,8 @@ class BeromeBot(discord.Client):
             ):
                 if msg.author.bot:
                     if self.user and msg.author.id == self.user.id:
-                        # Our own message — skip tool status updates
                         if not any(msg.content.startswith(p) for p in _tool_prefixes):
                             messages.append(("assistant", msg.content))
-                    # Ignore other bots
                 else:
                     content = msg.content
                     if self.user:
@@ -175,7 +203,6 @@ class BeromeBot(discord.Client):
                         content = content.replace(f"<@!{self.user.id}>", "")
                     content = content.strip()
                     if content:
-                        # Prefix with display name so the LLM sees per-user style
                         display = msg.author.display_name
                         messages.append(("user", f"[{display}]: {content}"))
         except (discord.Forbidden, discord.HTTPException) as exc:
@@ -213,11 +240,20 @@ class BeromeBot(discord.Client):
         self.tree.add_command(_StatusCommand(self))
         self.tree.add_command(_ProviderCommand(self))
         self.tree.add_command(_HelpCommand(self))
+        self.tree.add_command(_ActivateCommand(self))
+        self.tree.add_command(_DeactivateCommand(self))
+        self.tree.add_command(_TeachCommand(self))
+        self.tree.add_command(_ForgetCommand(self))
+        self.tree.add_command(_MemoriesCommand(self))
         await self.tree.sync()
         logger.info("Slash commands synced.")
 
     async def on_ready(self) -> None:
-        logger.info("Berome Discord bot ready. Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "?")
+        logger.info(
+            "Berome Discord bot ready. Logged in as %s (ID: %s)",
+            self.user,
+            self.user.id if self.user else "?",
+        )
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.listening,
@@ -236,10 +272,13 @@ class BeromeBot(discord.Client):
             return
 
         user_text = self._extract_text(message)
-        if not user_text:
+        images = await self._extract_images(message)
+
+        # Ignore messages with no text AND no images
+        if not user_text and not images:
             return
 
-        await self._handle_message(message, user_text)
+        await self._handle_message(message, user_text, images)
 
     def _should_respond(self, message: discord.Message) -> bool:
         """
@@ -247,15 +286,20 @@ class BeromeBot(discord.Client):
 
         Priority order:
         1. DMs → always respond.
-        2. Channel in DISCORD_ALLOWED_CHANNELS → always respond.
-        3. DISCORD_REQUIRE_MENTION=false → always respond.
-        4. Bot is mentioned → respond.
-        5. Otherwise → ignore.
+        2. Channel in _active_channels → always respond.
+        3. Channel in DISCORD_ALLOWED_CHANNELS → always respond.
+        4. DISCORD_REQUIRE_MENTION=false → always respond.
+        5. Bot is mentioned → respond.
+        6. Otherwise → ignore.
         """
         if isinstance(message.channel, discord.DMChannel):
             return True
 
         channel_id = message.channel.id
+
+        if channel_id in self._active_channels:
+            return True
+
         if channel_id in settings.discord_allowed_channel_ids():
             return True
 
@@ -275,14 +319,45 @@ class BeromeBot(discord.Client):
             text = text.replace(f"<@!{self.user.id}>", "")
         return text.strip()
 
+    async def _extract_images(self, message: discord.Message) -> list[dict]:
+        """Download image attachments and return Anthropic content blocks."""
+        blocks: list[dict] = []
+        for attachment in message.attachments:
+            mime = attachment.content_type or ""
+            if mime.split(";")[0].strip() not in _IMAGE_MIME_TYPES:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(attachment.url)
+                    resp.raise_for_status()
+                    data = base64.standard_b64encode(resp.content).decode()
+                    media_type = mime.split(";")[0].strip()
+                    blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data,
+                        },
+                    })
+            except Exception as exc:
+                logger.warning("Failed to download image attachment: %s", exc)
+        return blocks
+
     # ── Core response handler ──────────────────────────────────────────────
 
-    async def _handle_message(self, message: discord.Message, user_text: str) -> None:
+    async def _handle_message(
+        self,
+        message: discord.Message,
+        user_text: str,
+        images: list[dict],
+    ) -> None:
         """
-        Process one user message and send the bot's reply.
+        Process one user message (optionally with images) and send the reply.
 
-        Uses Discord's native typing indicator while generating, then sends
-        the response as a new message. No placeholder message is shown.
+        When images are present, builds a multimodal content block list and
+        injects it directly into the session history, then calls
+        continue_agentic_stream() so no duplicate user message is added.
         """
         channel = message.channel
         session = await self._get_session(channel)
@@ -295,8 +370,7 @@ class BeromeBot(discord.Client):
             return
 
         async def on_tool_call(name: str, args: dict) -> None:
-            # Typing indicator is already showing; no extra message needed
-            pass
+            pass  # Typing indicator is already showing
 
         async def on_tool_result(result) -> None:
             if result.error:
@@ -323,10 +397,20 @@ class BeromeBot(discord.Client):
 
         response_parts: list[str] = []
         try:
-            # channel.typing() shows Discord's native "Bot is typing..." indicator
-            # and auto-refreshes every 5 seconds for as long as the block runs.
             async with channel.typing():
-                if hasattr(session.provider, "chat_with_tools"):
+                if images:
+                    # Build multimodal content block (images + optional text)
+                    content_blocks: list[dict] = list(images)
+                    if user_text:
+                        content_blocks.append({"type": "text", "text": user_text})
+                    else:
+                        content_blocks.append({"type": "text", "text": "What's in this image?"})
+                    session.add_history_message("user", content_blocks)
+                    async for chunk in session.continue_agentic_stream(
+                        on_tool_call, on_tool_result, require_confirmation
+                    ):
+                        response_parts.append(chunk)
+                elif hasattr(session.provider, "chat_with_tools"):
                     async for chunk in session.agentic_stream(
                         user_text, on_tool_call, on_tool_result, require_confirmation
                     ):
@@ -387,7 +471,11 @@ class _StatusCommand(app_commands.Command):
     async def _callback(self, interaction: discord.Interaction) -> None:
         channel_id = interaction.channel_id
         session_count = len(self._bot._sessions)
-        lines = [f"**Active sessions:** {session_count}"]
+        active_count = len(self._bot._active_channels)
+        lines = [
+            f"**Active sessions:** {session_count}",
+            f"**Active channels (no-mention mode):** {active_count}",
+        ]
 
         if channel_id and channel_id in self._bot._sessions:
             sess = self._bot._sessions[channel_id]
@@ -421,7 +509,6 @@ class _ProviderCommand(app_commands.Command):
         name: Optional[str] = None,
     ) -> None:
         channel_id = interaction.channel_id
-        # Use existing session if present; create lazily only when switching
         session = self._bot._sessions.get(channel_id) if channel_id else None
         if session is None and name is not None:
             session = await self._bot._get_session(interaction.channel)
@@ -449,6 +536,140 @@ class _ProviderCommand(app_commands.Command):
             )
 
 
+class _ActivateCommand(app_commands.Command):
+    """Make the bot respond to all messages in this channel (no @mention needed)."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="activate",
+            description="Berome will respond to all messages in this channel (no @mention needed)",
+            callback=self._callback,
+        )
+
+    async def _callback(self, interaction: discord.Interaction) -> None:
+        channel_id = interaction.channel_id
+        if channel_id is None:
+            await interaction.response.send_message("Can't determine channel.", ephemeral=True)
+            return
+        self._bot._active_channels.add(channel_id)
+        save_active_channels(self._bot._active_channels)
+        await interaction.response.send_message(
+            "Activated — I'll respond to every message in this channel now.", ephemeral=True
+        )
+
+
+class _DeactivateCommand(app_commands.Command):
+    """Stop responding to all messages; require @mention again."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="deactivate",
+            description="Berome will only respond when @mentioned in this channel",
+            callback=self._callback,
+        )
+
+    async def _callback(self, interaction: discord.Interaction) -> None:
+        channel_id = interaction.channel_id
+        if channel_id is None:
+            await interaction.response.send_message("Can't determine channel.", ephemeral=True)
+            return
+        self._bot._active_channels.discard(channel_id)
+        save_active_channels(self._bot._active_channels)
+        await interaction.response.send_message(
+            "Deactivated — I'll only respond when @mentioned.", ephemeral=True
+        )
+
+
+class _TeachCommand(app_commands.Command):
+    """Teach the bot a persistent fact about this server."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="teach",
+            description="Teach Berome a persistent fact about this server or its members",
+            callback=self._callback,
+        )
+
+    async def _callback(self, interaction: discord.Interaction, fact: str) -> None:
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "Teaching only works in a server, not in DMs.", ephemeral=True
+            )
+            return
+        memories = add_memory(guild_id, fact)
+        # Invalidate existing sessions for this guild so they pick up new memories
+        await interaction.response.send_message(
+            f"Got it, I'll remember that.\n*You now have {len(memories)} fact(s) stored. "
+            f"Use `/clear` so I pick them up in the next message.*",
+            ephemeral=True,
+        )
+
+
+class _ForgetCommand(app_commands.Command):
+    """Remove a stored fact by index."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="forget",
+            description="Remove a stored memory by its number (use /memories to see the list)",
+            callback=self._callback,
+        )
+
+    async def _callback(self, interaction: discord.Interaction, number: int) -> None:
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This only works in a server.", ephemeral=True
+            )
+            return
+        try:
+            removed, remaining = remove_memory(guild_id, number - 1)
+            await interaction.response.send_message(
+                f"Forgotten: *{removed}*\n{len(remaining)} fact(s) remaining.",
+                ephemeral=True,
+            )
+        except IndexError:
+            await interaction.response.send_message(
+                f"No memory at position {number}. Use `/memories` to see the list.",
+                ephemeral=True,
+            )
+
+
+class _MemoriesCommand(app_commands.Command):
+    """List all stored facts for this server."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="memories",
+            description="List all facts Berome has been taught about this server",
+            callback=self._callback,
+        )
+
+    async def _callback(self, interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message(
+                "This only works in a server.", ephemeral=True
+            )
+            return
+        memories = load_memories(guild_id)
+        if not memories:
+            await interaction.response.send_message(
+                "No memories stored yet. Use `/teach` to add some.", ephemeral=True
+            )
+            return
+        lines = [f"{i + 1}. {m}" for i, m in enumerate(memories)]
+        await interaction.response.send_message(
+            "**Server memories:**\n" + "\n".join(lines), ephemeral=True
+        )
+
+
 class _HelpCommand(app_commands.Command):
     """Show usage and available commands."""
 
@@ -465,16 +686,21 @@ class _HelpCommand(app_commands.Command):
             "**Berome Discord Bot**\n\n"
             "**Usage:**\n"
             "- Mention me (`@Berome <message>`) to chat\n"
-            "- In DMs, just type freely\n"
-            "- In channels listed in `DISCORD_ALLOWED_CHANNELS`, type without mention\n\n"
+            "- Attach images to any message — I can analyse them\n"
+            "- In DMs, just type freely\n\n"
             "**Slash Commands:**\n"
-            "`/clear` — Clear conversation history for this channel\n"
-            "`/status` — Show session info and token usage\n"
-            "`/provider [name]` — Show or switch LLM provider (`anthropic` / `ollama`)\n"
-            "`/berome-help` — Show this help\n\n"
-            "**Tools available:**\n"
+            "`/activate` — respond to ALL messages in this channel (no @mention)\n"
+            "`/deactivate` — go back to @mention-only mode\n"
+            "`/teach <fact>` — teach me something to remember about this server\n"
+            "`/memories` — list everything I've been taught\n"
+            "`/forget <number>` — remove a memory by its number\n"
+            "`/clear` — clear conversation history for this channel\n"
+            "`/status` — show session info and token usage\n"
+            "`/provider [name]` — show or switch LLM provider (`anthropic` / `ollama`)\n"
+            "`/berome-help` — show this help\n\n"
+            "**Tools:**\n"
             "📖 read_file  📝 write_file  📁 list_directory  📂 create_directory\n"
-            "⚙️ run_command *(requires confirmation)*  🗑️ delete_file"
+            "⚙️ run_command *(requires confirmation)*  🗑️ delete_file  🔍 web_search"
         )
         await interaction.response.send_message(help_text, ephemeral=True)
 
@@ -482,22 +708,8 @@ class _HelpCommand(app_commands.Command):
 # ── Utility functions ──────────────────────────────────────────────────────────
 
 
-def _format_args_preview(args: dict, max_len: int = 80) -> str:
-    """Format tool arguments as a short preview string."""
-    parts = []
-    for k, v in args.items():
-        v_str = repr(v)
-        if len(v_str) > 40:
-            v_str = v_str[:37] + "..."
-        parts.append(f"{k}={v_str}")
-    result = ", ".join(parts)
-    return result[:max_len] + "..." if len(result) > max_len else result
-
-
 async def _send_response(content: str, channel: discord.abc.Messageable) -> None:
-    """
-    Send the full response, splitting across multiple messages if over 2000 chars.
-    """
+    """Send the full response, splitting across multiple messages if over 2000 chars."""
     for chunk in _split_message(content):
         try:
             await channel.send(chunk)
@@ -523,7 +735,6 @@ def _split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
             chunks.append(text)
             break
 
-        # Try to split at a newline within the limit
         split_pos = text.rfind("\n", 0, limit)
         if split_pos == -1:
             split_pos = limit
@@ -531,10 +742,8 @@ def _split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:
         chunk = text[:split_pos]
         text = text[split_pos:].lstrip("\n")
 
-        # Check if we cut inside a code fence (odd number of ``` up to split_pos)
         fence_count = chunk.count("```")
         if fence_count % 2 == 1:
-            # We're inside an open fence — close it in this chunk and reopen next
             chunk = chunk + "\n```"
             text = "```\n" + text
 

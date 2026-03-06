@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Awaitable, Callable, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional, Union
 
 from berome.agents.base import Agent, AgentTask
 from berome.prompts import load as _load_prompt
@@ -21,8 +21,8 @@ class ChatAgent(Agent):
         self._history: list[LLMMessage] = []
         self._system_prompt = system_prompt
 
-    def add_message(self, role: str, content: str) -> None:
-        self._history.append(LLMMessage(role=role, content=content))  # type: ignore[arg-type]
+    def add_message(self, role: str, content: Union[str, list]) -> None:
+        self._history.append(LLMMessage(role=role, content=content))
 
     def clear_history(self) -> None:
         self._history.clear()
@@ -70,9 +70,39 @@ class ChatAgent(Agent):
         (or max 20 iterations).  The final text response is yielded as a
         single chunk.
         """
-        from berome.tools.executor import execute_tool
-
         self.add_message("user", user_input)
+        async for chunk in self._run_agentic_loop(
+            tools, on_tool_call, on_tool_result, require_confirmation, on_llm_response
+        ):
+            yield chunk
+
+    async def continue_agentic_generation(
+        self,
+        tools: list[dict],
+        on_tool_call: Callable[[str, dict], Awaitable[None]],
+        on_tool_result: Callable,
+        require_confirmation: Optional[Callable[[str], Awaitable[bool]]] = None,
+        on_llm_response: Optional[Callable[[LLMResponse], None]] = None,
+    ) -> AsyncIterator[str]:
+        """
+        Run the agentic loop using the current history as-is (no new user message
+        injected). Used when the caller has already added the user message — e.g.
+        a multimodal message with image content blocks.
+        """
+        async for chunk in self._run_agentic_loop(
+            tools, on_tool_call, on_tool_result, require_confirmation, on_llm_response
+        ):
+            yield chunk
+
+    async def _run_agentic_loop(
+        self,
+        tools: list[dict],
+        on_tool_call: Callable[[str, dict], Awaitable[None]],
+        on_tool_result: Callable,
+        require_confirmation: Optional[Callable[[str], Awaitable[bool]]] = None,
+        on_llm_response: Optional[Callable[[LLMResponse], None]] = None,
+    ) -> AsyncIterator[str]:
+        from berome.tools.executor import execute_tool
 
         for _iteration in range(20):
             response = await self._llm.chat_with_tools(  # type: ignore[attr-defined]
@@ -85,12 +115,10 @@ class ChatAgent(Agent):
                 on_llm_response(response)
 
             if not response.tool_calls:
-                # Final text — yield and finish
                 self.add_message("assistant", response.content)
                 yield response.content
                 return
 
-            # Assistant turn with tool calls — store in history
             self._history.append(
                 LLMMessage(
                     role="assistant",
@@ -99,14 +127,12 @@ class ChatAgent(Agent):
                 )
             )
 
-            # Execute each tool and accumulate results
             for tc in response.tool_calls:
                 await on_tool_call(tc.name, tc.arguments)
                 result = await execute_tool(
                     tc.name, tc.arguments, tc.id, require_confirmation
                 )
                 await on_tool_result(result)
-                # Store tool result in history
                 self._history.append(
                     LLMMessage(
                         role="tool",
@@ -115,6 +141,5 @@ class ChatAgent(Agent):
                     )
                 )
 
-        # Reached iteration limit
         self.add_message("assistant", "Maximum tool use iterations reached.")
         yield "Maximum tool use iterations reached."

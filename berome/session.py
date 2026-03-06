@@ -109,12 +109,41 @@ class BeromeSession:
                 yield chunk
             return
 
-        # Reset per-response counters before starting
         self._last_input_tokens = 0
         self._last_output_tokens = 0
 
         async for chunk in self._chat_agent.stream_agentic_response(
             user_input=user_input,
+            tools=TOOL_DEFINITIONS,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+            require_confirmation=require_confirmation,
+            on_llm_response=self._accumulate_tokens,
+        ):
+            yield chunk
+
+    async def continue_agentic_stream(
+        self,
+        on_tool_call: Callable[[str, dict], Awaitable[None]],
+        on_tool_result: Callable,
+        require_confirmation: Optional[Callable[[str], Awaitable[bool]]] = None,
+    ):
+        """
+        Run the agentic loop using whatever is already in history (no new user
+        message injected). Used after manually adding a multimodal message.
+        """
+        from berome.tools.definitions import TOOL_DEFINITIONS
+
+        if not hasattr(self._provider, "chat_with_tools"):
+            # Fallback: plain stream from current history — not ideal but safe
+            async for chunk in self._chat_agent.stream_response(""):
+                yield chunk
+            return
+
+        self._last_input_tokens = 0
+        self._last_output_tokens = 0
+
+        async for chunk in self._chat_agent.continue_agentic_generation(
             tools=TOOL_DEFINITIONS,
             on_tool_call=on_tool_call,
             on_tool_result=on_tool_result,

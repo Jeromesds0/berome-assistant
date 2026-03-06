@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Literal, Union
 
 
 @dataclass
@@ -19,7 +19,8 @@ class ToolCall:
 @dataclass
 class LLMMessage:
     role: Literal["user", "assistant", "system", "tool"]
-    content: str
+    # str for plain text; list[dict] for multimodal content blocks (image + text)
+    content: Union[str, list] = ""
     # Populated when role=="tool" to link back to the assistant's tool_use
     tool_call_id: str = ""
     # Populated on assistant messages that contain tool calls (agentic loop)
