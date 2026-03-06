@@ -26,6 +26,33 @@ class OllamaProvider(LLMProvider):
     def model_name(self) -> str:
         return self._model
 
+    def _extract_content(self, content) -> tuple[str, list[str]]:
+        """Convert Anthropic-style content blocks to (text, base64_images) for Ollama.
+
+        Ollama vision format: {"role": "user", "content": "text", "images": ["b64..."]}
+        Note: image analysis requires a vision-capable model (llava, moondream, etc.).
+        """
+        if isinstance(content, str):
+            return content, []
+        text_parts: list[str] = []
+        images: list[str] = []
+        for block in content:
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "image":
+                src = block.get("source", {})
+                if src.get("type") == "base64":
+                    images.append(src.get("data", ""))
+        return " ".join(text_parts), images
+
+    def _build_ollama_message(self, msg: LLMMessage) -> dict:
+        """Build a single Ollama message dict, handling multimodal content."""
+        text, images = self._extract_content(msg.content)
+        m: dict = {"role": msg.role, "content": text}
+        if images:
+            m["images"] = images
+        return m
+
     def _build_payload(
         self,
         messages: list[LLMMessage],
@@ -36,11 +63,11 @@ class OllamaProvider(LLMProvider):
     ) -> dict:
         ollama_messages: list[dict] = []
         sys_parts = [system] if system else []
-        sys_parts += [m.content for m in messages if m.role == "system"]
+        sys_parts += [m.content for m in messages if m.role == "system" and isinstance(m.content, str)]
         if sys_parts:
             ollama_messages.append({"role": "system", "content": "\n".join(sys_parts)})
         ollama_messages += [
-            {"role": m.role, "content": m.content}
+            self._build_ollama_message(m)
             for m in messages
             if m.role != "system"
         ]
@@ -91,7 +118,7 @@ class OllamaProvider(LLMProvider):
                     ],
                 })
             else:
-                result.append({"role": msg.role, "content": msg.content})
+                result.append(self._build_ollama_message(msg))
         return result
 
     def _convert_tools(self, tools: list[dict]) -> list[dict]:
