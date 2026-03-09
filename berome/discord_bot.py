@@ -356,6 +356,7 @@ class BeromeBot(discord.Client):
         self.tree.add_command(_RoleDeleteCommand(self))
         self.tree.add_command(_RoleListCommand(self))
         self.tree.add_command(_DocumentCommand(self))
+        self.tree.add_command(_SearchCommand(self))
         await self.tree.sync()
         logger.info("Slash commands synced.")
 
@@ -1164,6 +1165,89 @@ class _DocumentCommand(app_commands.Command):
                 )
 
 
+class _SearchCommand(app_commands.Command):
+    """Search server message history for a word or phrase."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="search",
+            description="Search server message history for a word or phrase",
+            callback=self._callback,
+        )
+
+    async def _callback(
+        self,
+        interaction: discord.Interaction,
+        term: str,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        term    : Word or phrase to search for (case-insensitive)
+        channel : Limit search to a specific channel (searches all by default)
+        """
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"🔍 Searching for **{term}**{f' in #{channel.name}' if channel else ' across all channels'}...",
+            ephemeral=False,
+        )
+
+        search_channels: list[discord.TextChannel] = (
+            [channel] if channel else list(interaction.guild.text_channels)
+        )
+
+        term_lower = term.lower()
+        total_count = 0
+        channel_counts: dict[str, int] = {}
+        samples: list[str] = []  # up to 5 example messages
+
+        for ch in search_channels:
+            try:
+                ch_count = 0
+                async for msg in ch.history(limit=2000, oldest_first=False):
+                    if term_lower in msg.content.lower():
+                        ch_count += 1
+                        if len(samples) < 5:
+                            ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
+                            snippet = msg.content.replace("\n", " ")[:120]
+                            samples.append(
+                                f"> **#{ch.name}** · {msg.author.display_name} · {ts}\n> {snippet}"
+                            )
+                if ch_count:
+                    channel_counts[ch.name] = ch_count
+                    total_count += ch_count
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        if total_count == 0:
+            await interaction.followup.send(
+                f"No messages found containing **{term}** (searched last 2000 messages per channel)."
+            )
+            return
+
+        breakdown = "\n".join(
+            f"  #{name}: **{count}**" for name, count in sorted(channel_counts.items(), key=lambda x: -x[1])
+        )
+        sample_text = "\n\n".join(samples)
+
+        result = (
+            f"**Search results for \"{term}\"**\n"
+            f"Total: **{total_count}** mention(s) across {len(channel_counts)} channel(s)\n\n"
+            f"**By channel:**\n{breakdown}"
+        )
+        if samples:
+            result += f"\n\n**Examples:**\n{sample_text}"
+
+        # Split if too long
+        for chunk in _split_message(result):
+            await interaction.followup.send(chunk)
+
+
 class _HelpCommand(app_commands.Command):
     """Show usage and available commands."""
 
@@ -1200,6 +1284,8 @@ class _HelpCommand(app_commands.Command):
             "`/role-list` — list all server roles\n\n"
             "**Documents:**\n"
             "`/document <topic> [format]` — write an essay/research doc and send it as a file (md/html/txt)\n\n"
+            "**Search:**\n"
+            "`/search <term> [channel]` — count how many times a word/phrase appears in server history\n\n"
             "**Tools:**\n"
             "📖 read_file  📝 write_file  📁 list_directory  📂 create_directory\n"
             "⚙️ run_command *(requires confirmation)*  🗑️ delete_file  🔍 web_search"
