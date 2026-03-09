@@ -139,6 +139,7 @@ class BeromeBot(discord.Client):
         self._sessions: dict[int, BeromeSession] = {}
         self._session_last_used: dict[int, float] = {}
         self._active_channels: set[int] = load_active_channels()
+        self._channel_locks: dict[int, asyncio.Lock] = {}
 
     # ── Session management ─────────────────────────────────────────────────
 
@@ -242,6 +243,15 @@ class BeromeBot(discord.Client):
         for role, content in messages:
             session.add_history_message(role, content)
 
+        # Always inject an English reminder after seeding so that a
+        # non-English chat history doesn't cause the bot to reply in the
+        # wrong language.
+        session.add_history_message(
+            "user",
+            "[System]: Reminder — always reply in English, no matter what language the messages above are in.",
+        )
+        session.add_history_message("assistant", "Understood, I'll always reply in English.")
+
         if messages:
             logger.info(
                 "Seeded session for channel %s with %d messages",
@@ -275,6 +285,11 @@ class BeromeBot(discord.Client):
         self.tree.add_command(_TeachCommand(self))
         self.tree.add_command(_ForgetCommand(self))
         self.tree.add_command(_MemoriesCommand(self))
+        self.tree.add_command(_RoleGiveCommand(self))
+        self.tree.add_command(_RoleTakeCommand(self))
+        self.tree.add_command(_RoleCreateCommand(self))
+        self.tree.add_command(_RoleDeleteCommand(self))
+        self.tree.add_command(_RoleListCommand(self))
         await self.tree.sync()
         logger.info("Slash commands synced.")
 
@@ -365,18 +380,35 @@ class BeromeBot(discord.Client):
         return text.strip()
 
     async def _extract_images(self, message: discord.Message) -> list[dict]:
-        """Download image attachments and return Anthropic content blocks."""
-        blocks: list[dict] = []
+        """Download image attachments and embeds, return Anthropic content blocks."""
+        urls: list[str] = []
+
+        # Direct file attachments
         for attachment in message.attachments:
             mime = attachment.content_type or ""
-            if mime.split(";")[0].strip() not in _IMAGE_MIME_TYPES:
-                continue
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    resp = await client.get(attachment.url)
+            if mime.split(";")[0].strip() in _IMAGE_MIME_TYPES:
+                urls.append(attachment.url)
+
+        # Embedded images (e.g. images posted as embeds by bots or Discord auto-embeds)
+        for embed in message.embeds:
+            if embed.image and embed.image.url:
+                urls.append(embed.image.url)
+            elif embed.thumbnail and embed.thumbnail.url:
+                urls.append(embed.thumbnail.url)
+            elif embed.type == "image" and embed.url:
+                urls.append(embed.url)
+
+        blocks: list[dict] = []
+        async with httpx.AsyncClient(timeout=15) as client:
+            for url in urls:
+                try:
+                    resp = await client.get(url)
                     resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "image/png")
+                    media_type = content_type.split(";")[0].strip()
+                    if media_type not in _IMAGE_MIME_TYPES:
+                        media_type = "image/png"
                     data = base64.standard_b64encode(resp.content).decode()
-                    media_type = mime.split(";")[0].strip()
                     blocks.append({
                         "type": "image",
                         "source": {
@@ -385,8 +417,8 @@ class BeromeBot(discord.Client):
                             "data": data,
                         },
                     })
-            except Exception as exc:
-                logger.warning("Failed to download image attachment: %s", exc)
+                except Exception as exc:
+                    logger.warning("Failed to download image from %s: %s", url, exc)
         return blocks
 
     # ── Core response handler ──────────────────────────────────────────────
@@ -403,7 +435,23 @@ class BeromeBot(discord.Client):
         When images are present, builds a multimodal content block list and
         injects it directly into the session history, then calls
         continue_agentic_stream() so no duplicate user message is added.
+
+        A per-channel asyncio.Lock serializes concurrent calls so rapid
+        back-to-back messages never corrupt the same session's history.
         """
+        channel = message.channel
+        channel_id = channel.id  # type: ignore[attr-defined]
+        lock = self._channel_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            await self._handle_message_locked(message, user_text, images)
+
+    async def _handle_message_locked(
+        self,
+        message: discord.Message,
+        user_text: str,
+        images: list[dict],
+    ) -> None:
+        """Inner handler — called under the per-channel lock."""
         channel = message.channel
         session = await self._get_session(channel)
         if session is None:
@@ -714,6 +762,233 @@ class _MemoriesCommand(app_commands.Command):
         )
 
 
+# ── Role management commands ───────────────────────────────────────────────────
+
+
+def _require_manage_roles(interaction: discord.Interaction) -> bool:
+    """Return True if the invoking member has Manage Roles permission."""
+    member = interaction.user
+    if isinstance(member, discord.Member):
+        return member.guild_permissions.manage_roles
+    return False
+
+
+class _RoleGiveCommand(app_commands.Command):
+    """Assign a role to a member."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="role-give",
+            description="Assign a role to a server member (requires Manage Roles)",
+            callback=self._callback,
+        )
+
+    async def _callback(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        role: discord.Role,
+    ) -> None:
+        if not _require_manage_roles(interaction):
+            await interaction.response.send_message(
+                "You need the **Manage Roles** permission to use this.", ephemeral=True
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+        bot_member = interaction.guild.me
+        if role >= bot_member.top_role:
+            await interaction.response.send_message(
+                f"I can't assign **{role.name}** — it's at or above my highest role.", ephemeral=True
+            )
+            return
+        try:
+            await member.add_roles(role, reason=f"Assigned by {interaction.user}")
+            await interaction.response.send_message(
+                f"Gave **{role.name}** to {member.mention}.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to assign that role.", ephemeral=True
+            )
+        except discord.HTTPException as exc:
+            await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
+
+
+class _RoleTakeCommand(app_commands.Command):
+    """Remove a role from a member."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="role-take",
+            description="Remove a role from a server member (requires Manage Roles)",
+            callback=self._callback,
+        )
+
+    async def _callback(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        role: discord.Role,
+    ) -> None:
+        if not _require_manage_roles(interaction):
+            await interaction.response.send_message(
+                "You need the **Manage Roles** permission to use this.", ephemeral=True
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+        bot_member = interaction.guild.me
+        if role >= bot_member.top_role:
+            await interaction.response.send_message(
+                f"I can't remove **{role.name}** — it's at or above my highest role.", ephemeral=True
+            )
+            return
+        try:
+            await member.remove_roles(role, reason=f"Removed by {interaction.user}")
+            await interaction.response.send_message(
+                f"Removed **{role.name}** from {member.mention}.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to remove that role.", ephemeral=True
+            )
+        except discord.HTTPException as exc:
+            await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
+
+
+class _RoleCreateCommand(app_commands.Command):
+    """Create a new role."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="role-create",
+            description="Create a new server role (requires Manage Roles)",
+            callback=self._callback,
+        )
+
+    async def _callback(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        color: Optional[str] = None,
+        mentionable: bool = False,
+        hoist: bool = False,
+    ) -> None:
+        if not _require_manage_roles(interaction):
+            await interaction.response.send_message(
+                "You need the **Manage Roles** permission to use this.", ephemeral=True
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+        role_color = discord.Color.default()
+        if color:
+            try:
+                role_color = discord.Color(int(color.lstrip("#"), 16))
+            except ValueError:
+                await interaction.response.send_message(
+                    "Invalid color. Use a hex code like `#ff5733`.", ephemeral=True
+                )
+                return
+        try:
+            role = await interaction.guild.create_role(
+                name=name,
+                color=role_color,
+                mentionable=mentionable,
+                hoist=hoist,
+                reason=f"Created by {interaction.user}",
+            )
+            await interaction.response.send_message(
+                f"Created role **{role.name}** (ID: `{role.id}`).", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to create roles.", ephemeral=True
+            )
+        except discord.HTTPException as exc:
+            await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
+
+
+class _RoleDeleteCommand(app_commands.Command):
+    """Delete an existing role."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="role-delete",
+            description="Delete a server role (requires Manage Roles)",
+            callback=self._callback,
+        )
+
+    async def _callback(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+    ) -> None:
+        if not _require_manage_roles(interaction):
+            await interaction.response.send_message(
+                "You need the **Manage Roles** permission to use this.", ephemeral=True
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+        bot_member = interaction.guild.me
+        if role >= bot_member.top_role:
+            await interaction.response.send_message(
+                f"I can't delete **{role.name}** — it's at or above my highest role.", ephemeral=True
+            )
+            return
+        name = role.name
+        try:
+            await role.delete(reason=f"Deleted by {interaction.user}")
+            await interaction.response.send_message(f"Deleted role **{name}**.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to delete that role.", ephemeral=True
+            )
+        except discord.HTTPException as exc:
+            await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
+
+
+class _RoleListCommand(app_commands.Command):
+    """List all roles in the server."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="role-list",
+            description="List all roles in this server",
+            callback=self._callback,
+        )
+
+    async def _callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+        roles = [r for r in reversed(interaction.guild.roles) if r.name != "@everyone"]
+        if not roles:
+            await interaction.response.send_message("No roles found.", ephemeral=True)
+            return
+        lines = [
+            f"`{r.id}` **{r.name}** — {len(r.members)} member(s)"
+            + (" *(mentionable)*" if r.mentionable else "")
+            for r in roles
+        ]
+        text = "**Server roles:**\n" + "\n".join(lines)
+        # Split if too long
+        if len(text) > DISCORD_MAX_LENGTH:
+            text = text[: DISCORD_MAX_LENGTH - 3] + "..."
+        await interaction.response.send_message(text, ephemeral=True)
+
+
 class _HelpCommand(app_commands.Command):
     """Show usage and available commands."""
 
@@ -742,6 +1017,12 @@ class _HelpCommand(app_commands.Command):
             "`/status` — show session info and token usage\n"
             "`/provider [name]` — show or switch LLM provider (`anthropic` / `ollama`)\n"
             "`/berome-help` — show this help\n\n"
+            "**Role Management** *(requires Manage Roles permission)*\n"
+            "`/role-give <member> <role>` — assign a role to a member\n"
+            "`/role-take <member> <role>` — remove a role from a member\n"
+            "`/role-create <name> [color] [mentionable] [hoist]` — create a new role\n"
+            "`/role-delete <role>` — delete a role\n"
+            "`/role-list` — list all server roles\n\n"
             "**Tools:**\n"
             "📖 read_file  📝 write_file  📁 list_directory  📂 create_directory\n"
             "⚙️ run_command *(requires confirmation)*  🗑️ delete_file  🔍 web_search"
