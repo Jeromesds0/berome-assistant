@@ -400,6 +400,21 @@ class BeromeBot(discord.Client):
         user_text = self._extract_text(message)
         images = await self._extract_images(message)
 
+        # If the user replied to a message, extract images from that message too.
+        # This lets users reply to a chart/graph and ask the bot to analyse it.
+        if message.reference is not None:
+            try:
+                ref_msg = message.reference.resolved
+                if not isinstance(ref_msg, discord.Message):
+                    ref_msg = await message.channel.fetch_message(  # type: ignore[attr-defined]
+                        message.reference.message_id
+                    )
+                ref_images = await self._extract_images(ref_msg)
+                # Prepend so the referenced image appears before the current message's images
+                images = ref_images + images
+            except Exception as exc:
+                logger.warning("Could not fetch referenced message for images: %s", exc)
+
         # Ignore messages with no text AND no images
         if not user_text and not images:
             return
