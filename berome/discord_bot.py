@@ -765,14 +765,6 @@ class _MemoriesCommand(app_commands.Command):
 # ── Role management commands ───────────────────────────────────────────────────
 
 
-def _require_manage_roles(interaction: discord.Interaction) -> bool:
-    """Return True if the invoking member has Manage Roles permission."""
-    member = interaction.user
-    if isinstance(member, discord.Member):
-        return member.guild_permissions.manage_roles
-    return False
-
-
 class _RoleGiveCommand(app_commands.Command):
     """Assign a role to a member."""
 
@@ -780,7 +772,7 @@ class _RoleGiveCommand(app_commands.Command):
         self._bot = bot
         super().__init__(
             name="role-give",
-            description="Assign a role to a server member (requires Manage Roles)",
+            description="Assign a role to a server member",
             callback=self._callback,
         )
 
@@ -790,19 +782,8 @@ class _RoleGiveCommand(app_commands.Command):
         member: discord.Member,
         role: discord.Role,
     ) -> None:
-        if not _require_manage_roles(interaction):
-            await interaction.response.send_message(
-                "You need the **Manage Roles** permission to use this.", ephemeral=True
-            )
-            return
         if interaction.guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
-            return
-        bot_member = interaction.guild.me
-        if role >= bot_member.top_role:
-            await interaction.response.send_message(
-                f"I can't assign **{role.name}** — it's at or above my highest role.", ephemeral=True
-            )
             return
         try:
             await member.add_roles(role, reason=f"Assigned by {interaction.user}")
@@ -811,7 +792,7 @@ class _RoleGiveCommand(app_commands.Command):
             )
         except discord.Forbidden:
             await interaction.response.send_message(
-                "I don't have permission to assign that role.", ephemeral=True
+                "I don't have permission to assign that role — make sure my role is above it in the hierarchy.", ephemeral=True
             )
         except discord.HTTPException as exc:
             await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
@@ -824,7 +805,7 @@ class _RoleTakeCommand(app_commands.Command):
         self._bot = bot
         super().__init__(
             name="role-take",
-            description="Remove a role from a server member (requires Manage Roles)",
+            description="Remove a role from a server member",
             callback=self._callback,
         )
 
@@ -834,19 +815,8 @@ class _RoleTakeCommand(app_commands.Command):
         member: discord.Member,
         role: discord.Role,
     ) -> None:
-        if not _require_manage_roles(interaction):
-            await interaction.response.send_message(
-                "You need the **Manage Roles** permission to use this.", ephemeral=True
-            )
-            return
         if interaction.guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
-            return
-        bot_member = interaction.guild.me
-        if role >= bot_member.top_role:
-            await interaction.response.send_message(
-                f"I can't remove **{role.name}** — it's at or above my highest role.", ephemeral=True
-            )
             return
         try:
             await member.remove_roles(role, reason=f"Removed by {interaction.user}")
@@ -855,7 +825,7 @@ class _RoleTakeCommand(app_commands.Command):
             )
         except discord.Forbidden:
             await interaction.response.send_message(
-                "I don't have permission to remove that role.", ephemeral=True
+                "I don't have permission to remove that role — make sure my role is above it in the hierarchy.", ephemeral=True
             )
         except discord.HTTPException as exc:
             await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
@@ -868,7 +838,7 @@ class _RoleCreateCommand(app_commands.Command):
         self._bot = bot
         super().__init__(
             name="role-create",
-            description="Create a new server role (requires Manage Roles)",
+            description="Create a new server role",
             callback=self._callback,
         )
 
@@ -880,11 +850,6 @@ class _RoleCreateCommand(app_commands.Command):
         mentionable: bool = False,
         hoist: bool = False,
     ) -> None:
-        if not _require_manage_roles(interaction):
-            await interaction.response.send_message(
-                "You need the **Manage Roles** permission to use this.", ephemeral=True
-            )
-            return
         if interaction.guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
             return
@@ -923,7 +888,7 @@ class _RoleDeleteCommand(app_commands.Command):
         self._bot = bot
         super().__init__(
             name="role-delete",
-            description="Delete a server role (requires Manage Roles)",
+            description="Delete a server role",
             callback=self._callback,
         )
 
@@ -932,19 +897,8 @@ class _RoleDeleteCommand(app_commands.Command):
         interaction: discord.Interaction,
         role: discord.Role,
     ) -> None:
-        if not _require_manage_roles(interaction):
-            await interaction.response.send_message(
-                "You need the **Manage Roles** permission to use this.", ephemeral=True
-            )
-            return
         if interaction.guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
-            return
-        bot_member = interaction.guild.me
-        if role >= bot_member.top_role:
-            await interaction.response.send_message(
-                f"I can't delete **{role.name}** — it's at or above my highest role.", ephemeral=True
-            )
             return
         name = role.name
         try:
@@ -952,7 +906,7 @@ class _RoleDeleteCommand(app_commands.Command):
             await interaction.response.send_message(f"Deleted role **{name}**.", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message(
-                "I don't have permission to delete that role.", ephemeral=True
+                "I don't have permission to delete that role — make sure my role is above it in the hierarchy.", ephemeral=True
             )
         except discord.HTTPException as exc:
             await interaction.response.send_message(f"Failed: {exc}", ephemeral=True)
@@ -1017,7 +971,7 @@ class _HelpCommand(app_commands.Command):
             "`/status` — show session info and token usage\n"
             "`/provider [name]` — show or switch LLM provider (`anthropic` / `ollama`)\n"
             "`/berome-help` — show this help\n\n"
-            "**Role Management** *(requires Manage Roles permission)*\n"
+            "**Role Management**\n"
             "`/role-give <member> <role>` — assign a role to a member\n"
             "`/role-take <member> <role>` — remove a role from a member\n"
             "`/role-create <name> [color] [mentionable] [hoist]` — create a new role\n"
