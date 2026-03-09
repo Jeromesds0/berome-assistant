@@ -64,14 +64,18 @@ async def _write_file(
     path = args.get("path", "")
     content = args.get("content", "")
     try:
-        p = Path(path)
+        p = Path(path) if path else Path("output.md")
+        # If the path resolves to an existing directory (e.g. "."), write
+        # a file inside it rather than failing with IsADirectoryError.
+        if p.is_dir():
+            p = p / "output.md"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         size = p.stat().st_size
         return ToolResult(
             tool_name="write_file",
             tool_call_id=tool_call_id,
-            output=f"Written {size:,} bytes to {path}",
+            output=f"Written {size:,} bytes to {p}",
         )
     except Exception as exc:
         return ToolResult(

@@ -481,9 +481,12 @@ class BeromeBot(discord.Client):
 
         async def on_tool_call(name: str, args: dict) -> None:
             if name == "write_file":
-                path = args.get("path", "")
-                if path:
-                    _pending_write_path.append(path)
+                raw = args.get("path", "") or "output.md"
+                p = Path(raw)
+                # Mirror the executor's sanitisation: dir → dir/output.md
+                if p.is_dir():
+                    p = p / "output.md"
+                _pending_write_path.append(str(p))
             # Post a visible status line so users can see the bot working
             template = _TOOL_STATUS.get(name)
             if template:
@@ -550,6 +553,17 @@ class BeromeBot(discord.Client):
         full_response = "".join(response_parts).strip()
         if not full_response and not written_docs:
             return
+
+        # If the bot produced a long text response (likely a document) but didn't
+        # write a file, save it automatically and attach it.
+        _DOC_KEYWORDS = {"essay", "document", "report", "research", "write", "article"}
+        is_doc_request = bool(_DOC_KEYWORDS & set(user_text.lower().split()))
+        if full_response and not written_docs and is_doc_request and len(full_response) > 600:
+            slug = "_".join(user_text.lower().split()[:5])[:40]
+            auto_path = Path(f"{slug}.md")
+            auto_path.write_text(full_response, encoding="utf-8")
+            written_docs.append(auto_path)
+            full_response = ""  # don't also dump it as chat
 
         if full_response:
             await _send_response(full_response, channel)
