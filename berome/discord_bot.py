@@ -161,6 +161,7 @@ class BeromeBot(discord.Client):
                 session = BeromeSession(system_prompt=system_prompt)
                 await self._seed_members(session, channel)
                 await self._seed_history(session, channel)
+                await self._seed_other_channels(session, channel)
                 self._sessions[channel_id] = session
             except RuntimeError as exc:
                 logger.error(
@@ -260,6 +261,68 @@ class BeromeBot(discord.Client):
                 getattr(channel, "id", "?"),
                 len(messages),
             )
+
+    async def _seed_other_channels(
+        self, session: BeromeSession, current_channel: discord.abc.Messageable
+    ) -> None:
+        """Seed recent messages from every other readable text channel in the guild.
+
+        Gives the bot server-wide context so it can answer questions like
+        "what was said in #general?" or "do you know about the conversation in #dev?".
+        Limited to the last 15 messages per channel to keep context manageable.
+        """
+        guild = getattr(current_channel, "guild", None)
+        if guild is None:
+            return  # DM — no other channels
+
+        current_id = getattr(current_channel, "id", None)
+        _tool_prefixes = tuple(TOOL_EMOJI.values())
+        cross: list[tuple[str, str]] = []
+
+        for ch in guild.text_channels:
+            if ch.id == current_id:
+                continue  # already seeded above
+            try:
+                ch_msgs: list[tuple[str, str]] = []
+                async for msg in ch.history(limit=15, oldest_first=False):
+                    if msg.author.bot:
+                        if self.user and msg.author.id == self.user.id:
+                            if not any(msg.content.startswith(p) for p in _tool_prefixes):
+                                ch_msgs.append(("assistant", f"[#{ch.name}] {msg.content}"))
+                    else:
+                        content = msg.content
+                        if self.user:
+                            content = content.replace(f"<@{self.user.id}>", "")
+                            content = content.replace(f"<@!{self.user.id}>", "")
+                        content = content.strip()
+                        if content:
+                            display = msg.author.display_name
+                            ch_msgs.append(("user", f"[#{ch.name}] [{display}]: {content}"))
+                # Reverse so messages are chronological
+                cross.extend(reversed(ch_msgs))
+            except (discord.Forbidden, discord.HTTPException):
+                pass  # Skip channels the bot can't read
+
+        if not cross:
+            return
+
+        session.add_history_message(
+            "user",
+            "[System]: Below are recent messages from other channels in this server. "
+            "You can reference them when asked about conversations in those channels.",
+        )
+        session.add_history_message(
+            "assistant",
+            "Got it — I can see the recent history from all the other channels.",
+        )
+        for role, content in cross:
+            session.add_history_message(role, content)
+
+        logger.info(
+            "Seeded cross-channel history: %d messages from %d channel(s)",
+            len(cross),
+            len({m[1].split("]")[0] for m in cross}),
+        )
 
     def _evict_stale_sessions(self) -> None:
         """Remove sessions that have been idle for longer than SESSION_TTL."""
