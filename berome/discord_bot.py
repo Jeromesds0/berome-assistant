@@ -469,11 +469,29 @@ class BeromeBot(discord.Client):
         _pending_write_path: list[str] = []  # filled by on_tool_call
         written_docs: list[Path] = []
 
+        _TOOL_STATUS: dict[str, str] = {
+            "web_search": "🔍 Searching: **{query}**",
+            "image_search": "🖼️ Image search: **{query}**",
+            "read_file": "📖 Reading: `{path}`",
+            "write_file": "📝 Writing: `{path}`",
+            "run_command": "⚙️ Running: `{command}`",
+            "list_directory": "📁 Listing: `{path}`",
+            "delete_file": "🗑️ Deleting: `{path}`",
+        }
+
         async def on_tool_call(name: str, args: dict) -> None:
             if name == "write_file":
                 path = args.get("path", "")
                 if path:
                     _pending_write_path.append(path)
+            # Post a visible status line so users can see the bot working
+            template = _TOOL_STATUS.get(name)
+            if template:
+                try:
+                    status = template.format_map({k: str(v)[:80] for k, v in args.items()})
+                    await channel.send(status)
+                except (discord.HTTPException, KeyError):
+                    pass
 
         async def on_tool_result(result) -> None:
             if result.tool_name == "write_file" and not result.error and _pending_write_path:
@@ -483,7 +501,7 @@ class BeromeBot(discord.Client):
             if result.error:
                 try:
                     await channel.send(
-                        f"Tool error (`{result.tool_name}`): {result.output[:400]}",
+                        f"⚠️ Tool error (`{result.tool_name}`): {result.output[:400]}",
                         reference=message,
                     )
                 except discord.HTTPException:
@@ -1015,11 +1033,25 @@ class _DocumentCommand(app_commands.Command):
         written_docs: list[Path] = []
         _pending: list[str] = []
 
+        _DOC_TOOL_STATUS: dict[str, str] = {
+            "web_search": "🔍 Researching: **{query}**",
+            "image_search": "🖼️ Finding images: **{query}**",
+            "read_file": "📖 Reading: `{path}`",
+            "write_file": "📝 Writing document: `{path}`",
+        }
+
         async def on_tool_call(name: str, args: dict) -> None:
             if name == "write_file":
                 path = args.get("path", "")
                 if path:
                     _pending.append(path)
+            template = _DOC_TOOL_STATUS.get(name)
+            if template:
+                try:
+                    status = template.format_map({k: str(v)[:80] for k, v in args.items()})
+                    await channel.send(status)
+                except (discord.HTTPException, KeyError):
+                    pass
 
         async def on_tool_result(result) -> None:
             if result.tool_name == "write_file" and not result.error and _pending:
