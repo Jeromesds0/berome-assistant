@@ -161,7 +161,6 @@ class BeromeBot(discord.Client):
                 session = BeromeSession(system_prompt=system_prompt)
                 await self._seed_members(session, channel)
                 await self._seed_history(session, channel)
-                await self._seed_other_channels(session, channel)
                 self._sessions[channel_id] = session
             except RuntimeError as exc:
                 logger.error(
