@@ -402,16 +402,22 @@ class BeromeBot(discord.Client):
 
         # If the user replied to a message, extract images from that message too.
         # This lets users reply to a chart/graph and ask the bot to analyse it.
-        if message.reference is not None:
+        # Always use fetch_message — message.reference.resolved may have incomplete
+        # attachment data from the gateway event (missing content_type / CDN URLs).
+        if message.reference is not None and message.reference.message_id is not None:
             try:
-                ref_msg = message.reference.resolved
-                if not isinstance(ref_msg, discord.Message):
-                    ref_msg = await message.channel.fetch_message(  # type: ignore[attr-defined]
-                        message.reference.message_id
-                    )
+                ref_msg = await message.channel.fetch_message(  # type: ignore[attr-defined]
+                    message.reference.message_id
+                )
                 ref_images = await self._extract_images(ref_msg)
                 # Prepend so the referenced image appears before the current message's images
                 images = ref_images + images
+                if ref_images:
+                    logger.info(
+                        "Extracted %d image(s) from referenced message %d",
+                        len(ref_images),
+                        message.reference.message_id,
+                    )
             except Exception as exc:
                 logger.warning("Could not fetch referenced message for images: %s", exc)
 
@@ -465,9 +471,14 @@ class BeromeBot(discord.Client):
         urls: list[str] = []
 
         # Direct file attachments
+        _EXT_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".gif": "image/gif", ".webp": "image/webp"}
         for attachment in message.attachments:
-            mime = attachment.content_type or ""
-            if mime.split(";")[0].strip() in _IMAGE_MIME_TYPES:
+            mime = (attachment.content_type or "").split(";")[0].strip()
+            if mime not in _IMAGE_MIME_TYPES:
+                # Fallback: infer from filename extension
+                mime = _EXT_MIME.get(Path(attachment.filename).suffix.lower(), "")
+            if mime in _IMAGE_MIME_TYPES:
                 urls.append(attachment.url)
 
         # Embedded images (e.g. images posted as embeds by bots or Discord auto-embeds)
