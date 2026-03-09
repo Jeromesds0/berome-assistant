@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -290,6 +292,7 @@ class BeromeBot(discord.Client):
         self.tree.add_command(_RoleCreateCommand(self))
         self.tree.add_command(_RoleDeleteCommand(self))
         self.tree.add_command(_RoleListCommand(self))
+        self.tree.add_command(_DocumentCommand(self))
         await self.tree.sync()
         logger.info("Slash commands synced.")
 
@@ -462,10 +465,21 @@ class BeromeBot(discord.Client):
             )
             return
 
+        # Track files written by write_file tool so we can attach them
+        _pending_write_path: list[str] = []  # filled by on_tool_call
+        written_docs: list[Path] = []
+
         async def on_tool_call(name: str, args: dict) -> None:
-            pass  # Typing indicator is already showing
+            if name == "write_file":
+                path = args.get("path", "")
+                if path:
+                    _pending_write_path.append(path)
 
         async def on_tool_result(result) -> None:
+            if result.tool_name == "write_file" and not result.error and _pending_write_path:
+                p = Path(_pending_write_path.pop(0))
+                if p.exists() and p.suffix.lower() in {".md", ".html", ".txt", ".pdf"}:
+                    written_docs.append(p)
             if result.error:
                 try:
                     await channel.send(
@@ -516,10 +530,15 @@ class BeromeBot(discord.Client):
             return
 
         full_response = "".join(response_parts).strip()
-        if not full_response:
+        if not full_response and not written_docs:
             return
 
-        await _send_response(full_response, channel)
+        if full_response:
+            await _send_response(full_response, channel)
+
+        # Attach any documents the bot wrote during the tool loop
+        if written_docs:
+            await _send_documents(written_docs, channel)
 
 
 # ── Slash commands ─────────────────────────────────────────────────────────────
@@ -943,6 +962,99 @@ class _RoleListCommand(app_commands.Command):
         await interaction.response.send_message(text, ephemeral=True)
 
 
+class _DocumentCommand(app_commands.Command):
+    """Generate and send an essay or research document as a file."""
+
+    def __init__(self, bot: BeromeBot) -> None:
+        self._bot = bot
+        super().__init__(
+            name="document",
+            description="Ask Berome to write an essay/document and send it as a file",
+            callback=self._callback,
+        )
+
+    async def _callback(
+        self,
+        interaction: discord.Interaction,
+        topic: str,
+        format: Optional[str] = "md",
+    ) -> None:
+        """
+        Parameters
+        ----------
+        topic  : What to write about (e.g. "the causes of WW1")
+        format : Output format — md (default), html, or txt
+        """
+        fmt = (format or "md").lower().lstrip(".")
+        if fmt not in {"md", "html", "txt"}:
+            await interaction.response.send_message(
+                "Format must be `md`, `html`, or `txt`.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Writing a document on **{topic}** ({fmt.upper()})...", ephemeral=False
+        )
+
+        channel = interaction.channel
+        if channel is None:
+            return
+
+        session = await self._bot._get_session(channel)
+        if session is None:
+            await channel.send("LLM provider unavailable.")
+            return
+
+        filename = "_".join(topic.lower().split()[:6])[:40] + f".{fmt}"
+        prompt = (
+            f"[System]: Write a thorough, well-structured essay or research document about: {topic}. "
+            f"Save it using write_file with path '{filename}'. "
+            f"Format it as {'Markdown' if fmt == 'md' else fmt.upper()}."
+        )
+
+        written_docs: list[Path] = []
+        _pending: list[str] = []
+
+        async def on_tool_call(name: str, args: dict) -> None:
+            if name == "write_file":
+                path = args.get("path", "")
+                if path:
+                    _pending.append(path)
+
+        async def on_tool_result(result) -> None:
+            if result.tool_name == "write_file" and not result.error and _pending:
+                p = Path(_pending.pop(0))
+                if p.exists():
+                    written_docs.append(p)
+
+        async def no_confirm(command: str) -> bool:
+            return False  # No shell commands needed for document generation
+
+        response_parts: list[str] = []
+        try:
+            async with channel.typing():
+                async for chunk in session.agentic_stream(
+                    prompt, on_tool_call, on_tool_result, no_confirm
+                ):
+                    response_parts.append(chunk)
+        except Exception as exc:
+            logger.exception("Error during document generation")
+            await channel.send(f"Error: {str(exc)[:300]}")
+            return
+
+        if written_docs:
+            await _send_documents(written_docs, channel)
+        else:
+            # Fallback: send the response as a text file if no file was written
+            full = "".join(response_parts).strip()
+            if full:
+                ext = fmt
+                fb_filename = "_".join(topic.lower().split()[:6])[:40] + f".{ext}"
+                await channel.send(
+                    files=[discord.File(io.BytesIO(full.encode()), filename=fb_filename)]
+                )
+
+
 class _HelpCommand(app_commands.Command):
     """Show usage and available commands."""
 
@@ -977,6 +1089,8 @@ class _HelpCommand(app_commands.Command):
             "`/role-create <name> [color] [mentionable] [hoist]` — create a new role\n"
             "`/role-delete <role>` — delete a role\n"
             "`/role-list` — list all server roles\n\n"
+            "**Documents:**\n"
+            "`/document <topic> [format]` — write an essay/research doc and send it as a file (md/html/txt)\n\n"
             "**Tools:**\n"
             "📖 read_file  📝 write_file  📁 list_directory  📂 create_directory\n"
             "⚙️ run_command *(requires confirmation)*  🗑️ delete_file  🔍 web_search"
@@ -994,6 +1108,50 @@ async def _send_response(content: str, channel: discord.abc.Messageable) -> None
             await channel.send(chunk)
         except discord.HTTPException as exc:
             logger.warning("Failed to send response chunk: %s", exc)
+
+
+async def _send_documents(docs: list[Path], channel: discord.abc.Messageable) -> None:
+    """Attach written document files to a Discord message.
+
+    Supports .md, .html, .txt, and .pdf directly.
+    Optionally converts .md to .html if the markdown package is available.
+    """
+    files: list[discord.File] = []
+    for doc in docs:
+        try:
+            data = doc.read_bytes()
+            files.append(discord.File(io.BytesIO(data), filename=doc.name))
+
+            # If it's a .md file, also offer an HTML version
+            if doc.suffix.lower() == ".md":
+                try:
+                    import markdown as md_lib
+                    text = doc.read_text(encoding="utf-8")
+                    html_content = md_lib.markdown(text, extensions=["tables", "fenced_code"])
+                    html_full = (
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        "<style>body{font-family:sans-serif;max-width:800px;margin:auto;padding:2em}"
+                        "pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow:auto}"
+                        "code{background:#f4f4f4;padding:.2em .4em;border-radius:3px}"
+                        "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.5em}"
+                        "</style></head><body>"
+                        f"{html_content}</body></html>"
+                    )
+                    html_name = doc.stem + ".html"
+                    files.append(discord.File(io.BytesIO(html_full.encode()), filename=html_name))
+                except ImportError:
+                    pass
+        except Exception as exc:
+            logger.warning("Failed to attach document %s: %s", doc, exc)
+
+    if not files:
+        return
+    try:
+        # Discord allows up to 10 files per message
+        for i in range(0, len(files), 10):
+            await channel.send(files=files[i:i + 10])
+    except discord.HTTPException as exc:
+        logger.warning("Failed to send document attachments: %s", exc)
 
 
 def _split_message(text: str, limit: int = DISCORD_MAX_LENGTH) -> list[str]:

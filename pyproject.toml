@@ -20,6 +20,7 @@ dependencies = [
     "httpx>=0.27.0",
     "ddgs>=0.1.0",
     "prompt_toolkit>=3.0.47",
+    "markdown>=3.6",
 ]
 
 [project.optional-dependencies]
